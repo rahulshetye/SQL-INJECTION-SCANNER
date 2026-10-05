@@ -174,7 +174,7 @@ Unauthorized scanning of systems is illegal.
 
 ## 👨‍💻 Author
 
-**Aryan Dabholkar**  
+**Rahul Shetye** 
 Cybersecurity Enthusiast  
 
 ---
