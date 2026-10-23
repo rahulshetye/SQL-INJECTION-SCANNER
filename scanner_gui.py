@@ -104,6 +104,19 @@ def scan():
     # --- Auto-extract parameters ---
     parsed_url = urlparse(url)
     params_dict = {k: v[0] for k, v in parse_qs(parsed_url.query).items()}
+
+    # FIX: if there are no real GET parameters, there's nothing injectable.
+    # Previously this fell back to a fake 'input' param and, for GET requests,
+    # concatenated the raw payload onto the end of the URL (url + payload),
+    # which produces a malformed URL / different error page and falsely
+    # triggers "vulnerable" via byte-length diff or incidental keyword match.
+    if not params_dict and method == 'GET':
+        return jsonify({
+            'error': 'No GET parameters found in this URL (e.g. ?id=1). '
+                     'Nothing to test — add a query parameter or use POST mode.',
+            'meta': {'url': url}
+        }), 400
+
     param_names = list(params_dict.keys()) or ['input']
 
     results = []
@@ -134,10 +147,11 @@ def scan():
                     start = time.time()
 
                     if method == 'GET':
-                        if params_dict:
-                            test_url = inject_param(parsed_url, params_dict, param, payload)
-                        else:
-                            test_url = url + payload
+                        # params_dict is guaranteed non-empty here for GET
+                        # (we returned early above otherwise), so this always
+                        # does a proper parameter injection — no more raw
+                        # url + payload concatenation.
+                        test_url = inject_param(parsed_url, params_dict, param, payload)
                         response = req.get(test_url, timeout=timeout, verify=False)
                     else:
                         post_data = dict(params_dict) if params_dict else {}
