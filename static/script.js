@@ -246,21 +246,39 @@ async function startScan() {
   setProgress(5, 'Establishing baseline...', `0 / ${totalPayloads}`);
 
   let useSimulation = false;
+  let backendErrorMsg = null;
 
   try {
-    const res = await fetch('/scan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url,
-        method: document.getElementById('methodSelect').value,
-        timeout: parseInt(document.getElementById('timeout').value) || 8
-      }),
-      signal: AbortSignal.timeout(120000)
-    });
-    if (!res.ok) throw new Error('Backend error');
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
+    let res;
+    try {
+      res = await fetch('/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          method: document.getElementById('methodSelect').value,
+          timeout: parseInt(document.getElementById('timeout').value) || 8
+        }),
+        signal: AbortSignal.timeout(120000)
+      });
+    } catch (networkErr) {
+      // ── Genuine network-level failure (backend unreachable, CORS, timeout) ──
+      // Only THIS counts as "no backend" — fall through to demo mode below.
+      throw { kind: 'network', error: networkErr };
+    }
+
+    let data;
+    try {
+      data = await res.json();
+    } catch (parseErr) {
+      throw { kind: 'network', error: parseErr };
+    }
+
+    if (!res.ok || data.error) {
+      // ── Real backend responded, but with an error (e.g. no params found, bad URL,
+      // target unreachable). This is a REAL result, not a reason to fake data. ──
+      throw { kind: 'backend', error: new Error(data.error || `Backend error (HTTP ${res.status})`) };
+    }
 
     // ── Real backend mode ──
     const bLen = data.baseline_length;
@@ -316,9 +334,27 @@ async function startScan() {
     log(`[+] Risk Score: ${data.risk_score}/100 — ${data.risk_label}`, data.risk_score >= 40 ? 'vuln' : 'ok');
 
   } catch (e) {
-    // ── Demo / simulation mode ──
+    if (e && e.kind === 'backend') {
+      // ── Real backend error: show it honestly, do NOT fabricate a score ──
+      backendErrorMsg = e.error.message;
+      log(`[!] Backend error: ${backendErrorMsg}`, 'warn');
+      log('[!] Scan aborted — no results to report.', 'warn');
+
+      document.getElementById('progressPulse').classList.remove('active');
+      setProgress(0, 'Scan failed', `0 / ${totalPayloads}`);
+      isScanning = false;
+      btn.classList.remove('running');
+      btn.querySelector('.scan-btn-inner').innerHTML = `
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><polygon points="4,2 14,8 4,14" fill="currentColor"/></svg>
+        EXECUTE SCAN`;
+      document.getElementById('statusDot').className = 'status-dot';
+      document.getElementById('statusLabel').textContent = 'ERROR';
+      return; // bail out completely — do not fall through to demo mode
+    }
+
+    // ── Genuine network-level failure → demo / simulation mode ──
     useSimulation = true;
-    log('[~] Running in DEMO mode (Flask backend not detected)', 'warn');
+    log('[~] Running in DEMO mode (Flask backend unreachable)', 'warn');
     log('[~] Simulating multi-technique scan...', 'warn');
     log('', '');
 
