@@ -45,12 +45,20 @@ ERROR_KEYWORDS = [
 ]
 
 TIME_THRESHOLD = 4.0  # seconds — flag if response takes longer than this
+DIFF_THRESHOLD = 50   # bytes — how far a response must diverge to be suspicious
+
+# A harmless, clearly-non-malicious value that almost certainly matches no row.
+# Used to establish what a normal "not found" response looks like, so that a
+# payload which just also returns "not found" isn't mistaken for a vulnerability.
+NEGATIVE_CONTROL_VALUE = "zzz_nonexistent_control_09182"
+
 
 def extract_injectable_params(url):
     """Auto-extract all GET parameters from URL."""
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     return list(params.keys()), parsed
+
 
 def inject_param(parsed_url, params_dict, param_name, payload):
     """Inject payload into a specific parameter."""
@@ -59,6 +67,7 @@ def inject_param(parsed_url, params_dict, param_name, payload):
     new_query = urlencode(new_params)
     new_parsed = parsed_url._replace(query=new_query)
     return urlunparse(new_parsed)
+
 
 def calculate_risk_score(results):
     """Generate a 0-100 risk score based on findings."""
@@ -76,6 +85,7 @@ def calculate_risk_score(results):
                 score += 15   # Length diff only — lower confidence
     return min(score, 100)
 
+
 def risk_label(score):
     if score >= 70: return "CRITICAL"
     if score >= 40: return "HIGH"
@@ -83,13 +93,16 @@ def risk_label(score):
     if score > 0:   return "LOW"
     return "SAFE"
 
+
 @app.route('/')
 def index():
     return send_from_directory('static', 'index.html')
 
+
 @app.route('/static/<path:path>')
 def serve_static(path):
     return send_from_directory('static', path)
+
 
 @app.route('/scan', methods=['POST'])
 def scan():
@@ -105,11 +118,7 @@ def scan():
     parsed_url = urlparse(url)
     params_dict = {k: v[0] for k, v in parse_qs(parsed_url.query).items()}
 
-    # FIX: if there are no real GET parameters, there's nothing injectable.
-    # Previously this fell back to a fake 'input' param and, for GET requests,
-    # concatenated the raw payload onto the end of the URL (url + payload),
-    # which produces a malformed URL / different error page and falsely
-    # triggers "vulnerable" via byte-length diff or incidental keyword match.
+    # If there are no real GET parameters, there's nothing injectable.
     if not params_dict and method == 'GET':
         return jsonify({
             'error': 'No GET parameters found in this URL (e.g. ?id=1). '
@@ -127,7 +136,7 @@ def scan():
         "params_found": param_names
     }
 
-    # --- Baseline request ---
+    # --- Baseline request (valid/original value) ---
     try:
         start = time.time()
         if method == 'GET':
@@ -139,6 +148,34 @@ def scan():
     except Exception as e:
         return jsonify({'error': f'Baseline request failed: {str(e)}'}), 500
 
+    # --- Negative-control baseline (harmless value that shouldn't match anything) ---
+    # This tells us what a normal "no results" response looks like, so we don't
+    # mistake an app's ordinary not-found behavior for a SQL injection signal.
+    not_found_length = None
+    not_found_time = None
+    try:
+        start = time.time()
+        if method == 'GET':
+            if params_dict:
+                first_param = param_names[0]
+                control_url = inject_param(parsed_url, params_dict, first_param, NEGATIVE_CONTROL_VALUE)
+                control_resp = req.get(control_url, timeout=timeout, verify=False)
+            else:
+                control_resp = None
+        else:
+            control_data = dict(params_dict) if params_dict else {}
+            if param_names:
+                control_data[param_names[0]] = NEGATIVE_CONTROL_VALUE
+            control_resp = req.post(url, data=control_data, timeout=timeout, verify=False)
+        if control_resp is not None:
+            not_found_time = time.time() - start
+            not_found_length = len(control_resp.text)
+    except Exception:
+        # If the negative-control request fails, fall back to comparing against
+        # the normal baseline only (old behavior) rather than aborting the scan.
+        not_found_length = None
+        not_found_time = None
+
     # --- Run all payload categories ---
     for technique, payload_list in PAYLOADS.items():
         for payload in payload_list:
@@ -147,10 +184,6 @@ def scan():
                     start = time.time()
 
                     if method == 'GET':
-                        # params_dict is guaranteed non-empty here for GET
-                        # (we returned early above otherwise), so this always
-                        # does a proper parameter injection — no more raw
-                        # url + payload concatenation.
                         test_url = inject_param(parsed_url, params_dict, param, payload)
                         response = req.get(test_url, timeout=timeout, verify=False)
                     else:
@@ -159,15 +192,34 @@ def scan():
                         response = req.post(url, data=post_data, timeout=timeout, verify=False)
 
                     elapsed = time.time() - start
-                    diff = abs(normal_length - len(response.text))
+                    resp_len = len(response.text)
+
+                    diff_from_baseline = abs(normal_length - resp_len)
                     error_found = any(k in response.text.lower() for k in ERROR_KEYWORDS)
 
                     # Time-based: flag if response took suspiciously long
                     time_anomaly = (technique == 'time_based' and
-                                    elapsed >= TIME_THRESHOLD and
-                                    elapsed >= baseline_time + 3.0)
+                                     elapsed >= TIME_THRESHOLD and
+                                     elapsed >= baseline_time + 3.0)
 
-                    vulnerable = time_anomaly or error_found or (diff > 50 and technique != 'time_based')
+                    if not_found_length is not None:
+                        # Only count a length difference as suspicious if the response
+                        # ALSO differs meaningfully from the "harmless, no match" response.
+                        # A payload that just produces the same ordinary "not found" page
+                        # as any other non-matching input is not evidence of injection.
+                        diff_from_not_found = abs(not_found_length - resp_len)
+                        length_anomaly = (
+                            diff_from_baseline > DIFF_THRESHOLD and
+                            diff_from_not_found > DIFF_THRESHOLD
+                        )
+                        diff = diff_from_not_found  # report distance from the "normal" negative response
+                    else:
+                        # No negative control available — fall back to the simpler check,
+                        # same as before, for GET requests with no real params etc.
+                        length_anomaly = diff_from_baseline > DIFF_THRESHOLD
+                        diff = diff_from_baseline
+
+                    vulnerable = time_anomaly or error_found or (length_anomaly and technique != 'time_based')
 
                     results.append({
                         'payload': payload,
@@ -199,12 +251,14 @@ def scan():
         'meta': scan_meta,
         'baseline_length': normal_length,
         'baseline_time': round(baseline_time, 2),
+        'not_found_length': not_found_length,
         'results': results,
         'risk_score': score,
         'risk_label': label,
         'vulnerable_count': sum(1 for r in results if r.get('vulnerable')),
         'total_tests': len(results)
     })
+
 
 @app.route('/export', methods=['POST'])
 def export_report():
@@ -216,6 +270,7 @@ def export_report():
         "scan": data
     }
     return jsonify(report)
+
 
 if __name__ == '__main__':
     print("\n  VulnScan Pro — Flask Backend")
